@@ -317,7 +317,7 @@ plugin_bus_info_t getAvailableBusConfigs(Clap::Library *factory, uint32_t index)
           uint32_t informat = 0, outformat = 0;
           if (numinputs > 0)
           {
-            ext_aud->get(tmpplug, 0, false, &p);
+            ext_aud->get(tmpplug, 0, true, &p);
             switch (p.channel_count)
             {
               case 1:
@@ -349,6 +349,13 @@ plugin_bus_info_t getAvailableBusConfigs(Clap::Library *factory, uint32_t index)
                 break;
             }
           }
+          // An instrument has outputs and no inputs, which left informat at 0 --
+          // not a stem format at all (Mono is index 0 with ONE channel). Give it
+          // the output's format for its input, as Avid's own DemoMIDI_Synth
+          // describes itself; the process adapter maps no AAX inputs when the
+          // CLAP has no input ports, so the input stream is simply unused.
+          if (numinputs == 0 && numoutputs > 0) informat = outformat;
+
           // Only record a stem format when the plugin actually has audio ports.
           // A note-only plugin (0 in / 0 out) must leave stemformats empty so the
           // placeholder-stem path below can give it a Mono/Stereo passthrough

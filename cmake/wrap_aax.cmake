@@ -151,6 +151,18 @@ function(target_add_aax_wrapper)
         macos_include_clap_in_bundle(TARGET ${AX_TARGET}
                 MACOS_EMBEDDED_CLAP_LOCATION ${AX_MACOS_EMBEDDED_CLAP_LOCATION})
         macos_bundle_flag(TARGET ${AX_TARGET})
+
+        # The AAX format spec requires PkgInfo to be the package type followed
+        # by the PTul signature; the shared BNDL???? one macos_bundle_flag
+        # copies breaks that. Xcode writes its PkgInfo from the Info.plist,
+        # which already says TDMw/PTul; every other generator gets this copy,
+        # which runs after macos_bundle_flag's and replaces it.
+        if (NOT ${CMAKE_GENERATOR} STREQUAL "Xcode")
+            add_custom_command(TARGET ${AX_TARGET} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy
+                    ${CLAP_WRAPPER_CMAKE_CURRENT_SOURCE_DIR}/cmake/aaxBundlePkgInfo
+                    "$<TARGET_FILE_DIR:${AX_TARGET}>/../PkgInfo")
+        endif()
     endif()
     if(WIN32)
         message(STATUS "clap-wrapper: Building AAX Bundle Folder")
