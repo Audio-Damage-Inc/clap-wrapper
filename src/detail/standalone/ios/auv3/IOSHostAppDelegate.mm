@@ -129,6 +129,14 @@ static void IOSHostMIDIReadProc(const MIDIPacketList *pktlist, void *readProcRef
   [self instantiateAU];
 }
 
+- (BOOL)prefersStatusBarHidden
+{
+  // The host is the plugin and nothing else: no clock/battery strip, and no
+  // status-bar band insetting the plugin view -- the inset is also an offset
+  // between where the UI draws and where its touches land.
+  return YES;
+}
+
 - (void)setStatus:(NSString *)msg
 {
   self.statusLabel.text = msg;
@@ -643,11 +651,14 @@ static void IOSHostMIDIReadProc(const MIDIPacketList *pktlist, void *readProcRef
   [self addChildViewController:vc];
   vc.view.translatesAutoresizingMaskIntoConstraints = NO;
   [self.view addSubview:vc.view];
+  // The view bounds, NOT the safe area: pinning to the safe area insets the
+  // plugin below the status-bar band, and that inset lands between where the
+  // UI draws and where its touches arrive.
   [NSLayoutConstraint activateConstraints:@[
-    [vc.view.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
-    [vc.view.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor],
-    [vc.view.leadingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.leadingAnchor],
-    [vc.view.trailingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.trailingAnchor],
+    [vc.view.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+    [vc.view.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+    [vc.view.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+    [vc.view.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
   ]];
   [vc didMoveToParentViewController:self];
   self.statusLabel.hidden = YES;
