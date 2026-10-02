@@ -3,6 +3,7 @@
 #include "standalone_details.h"
 #include "standalone_host.h"
 #include "entry.h"
+#include "standalone_devices.h"
 
 namespace freeaudio::clap_wrapper::standalone
 {
@@ -88,6 +89,13 @@ std::shared_ptr<Clap::Plugin> mainCreatePlugin(const clap_plugin_entry *ee, cons
 
 void mainStartAudio()
 {
+  // Audio Damage addition: whatever the hosted plugin saved last time. It
+  // registers that before main -- the settings file is the plugin's -- and
+  // this turns the names in it into the ids and the port the two threads
+  // below are about to read. Nothing registered leaves both at their
+  // defaults, which is what the standalone always did.
+  devices::applyStartup();
+
   standaloneHost->startMIDIThread();
   standaloneHost->startAudioThread();
 }
