@@ -65,7 +65,12 @@ function(target_add_standalone_wrapper)
             ${CLAP_WRAPPER_CMAKE_CURRENT_SOURCE_DIR}/src/detail/standalone/standalone_host.cpp
             ${CLAP_WRAPPER_CMAKE_CURRENT_SOURCE_DIR}/src/detail/standalone/standalone_host_audio.cpp
             ${CLAP_WRAPPER_CMAKE_CURRENT_SOURCE_DIR}/src/detail/standalone/standalone_host_midi.cpp
+            ${CLAP_WRAPPER_CMAKE_CURRENT_SOURCE_DIR}/src/detail/standalone/standalone_devices.cpp
             )
+    # The device facade is what a hosted plugin's own settings UI talks to, so
+    # its header has to be reachable from the plugin's sources as well.
+    target_include_directories(${salib} PUBLIC
+            ${CLAP_WRAPPER_CMAKE_CURRENT_SOURCE_DIR}/src/detail/standalone)
     target_link_libraries(${salib}
             PUBLIC
             clap-wrapper-shared-detail

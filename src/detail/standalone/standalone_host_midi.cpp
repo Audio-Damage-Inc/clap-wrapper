@@ -14,6 +14,25 @@
 
 namespace freeaudio::clap_wrapper::standalone
 {
+// Audio Damage addition: the port names, for a hosted plugin's settings page.
+// A fresh RtMidiIn each time -- the list is what is plugged in NOW, and the
+// open inputs below are not it.
+std::vector<std::string> StandaloneHost::getMidiInputNames()
+{
+  std::vector<std::string> names;
+  try
+  {
+    auto midiIn = std::make_unique<RtMidiIn>();
+    const unsigned int count = midiIn->getPortCount();
+    for (unsigned int i = 0; i < count; ++i) names.push_back(midiIn->getPortName(i));
+  }
+  catch (RtMidiError &error)
+  {
+    error.printMessage();
+  }
+  return names;
+}
+
 void StandaloneHost::startMIDIThread()
 {
   try
@@ -28,9 +47,18 @@ void StandaloneHost::startMIDIThread()
     exit(EXIT_FAILURE);
   }
 
-  LOGDETAIL("MIDI: There are {} MIDI input sources available. Binding all.", numMidiPorts);
+  // selectedMidiPort is -1 for every port, which is the standalone's own
+  // default; a settings page may have narrowed it to one. A saved port that
+  // is no longer there binds everything rather than nothing -- silence is
+  // indistinguishable from a broken build.
+  const bool one = selectedMidiPort >= 0 && selectedMidiPort < static_cast<int>(numMidiPorts);
+
+  LOGDETAIL("MIDI: There are {} MIDI input sources available. Binding {}.", numMidiPorts,
+            one ? "one" : "all");
   for (unsigned int i = 0; i < numMidiPorts; i++)
   {
+    if (one && static_cast<int>(i) != selectedMidiPort) continue;
+
     try
     {
       auto midiIn = std::make_unique<RtMidiIn>();
@@ -44,6 +72,13 @@ void StandaloneHost::startMIDIThread()
       error.printMessage();
     }
   }
+}
+
+void StandaloneHost::restartMIDIThread()
+{
+  stopMIDIThread();
+  midiIns.clear();
+  startMIDIThread();
 }
 
 void StandaloneHost::processMIDIEvents(double deltatime, std::vector<unsigned char> *message)

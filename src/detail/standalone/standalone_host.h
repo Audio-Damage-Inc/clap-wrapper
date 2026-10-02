@@ -238,8 +238,16 @@ struct StandaloneHost : Clap::IHost
   std::vector<std::unique_ptr<RtMidiIn>> midiIns;
   uint32_t numMidiPorts{0};
   std::vector<uint32_t> currentMidiPorts;
+  // Which input port to bind. -1 is every port, which is what the standalone
+  // has always done and still starts on; a plugin's settings page may narrow
+  // it to one. (Audio Damage addition -- see standalone_devices.h.)
+  int selectedMidiPort{-1};
+  std::vector<std::string> getMidiInputNames();
   void startMIDIThread();
   void stopMIDIThread();
+  // Rebind on the current selection. RtMidi has no way to re-point an open
+  // port, so this closes every one and opens what is wanted.
+  void restartMIDIThread();
   void processMIDIEvents(double deltatime, std::vector<unsigned char> *message);
   static void midiCallback(double deltatime, std::vector<unsigned char> *message, void *userData);
 
