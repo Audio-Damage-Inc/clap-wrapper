@@ -287,44 +287,34 @@ void applyStartup()
 
   sh->displayAudioError = [](const std::string &text) { gLastError = text; };
 
+  // The plugin's saved choices become the standalone's own settings, which
+  // startAudioThread and startMIDIThread read. Written through to the
+  // standalone's settings file because startAudioThread loads that file.
+  auto &st = sh->settings;
+  st.audioApiName.clear();
   if (!gStartup.driver.empty())
   {
     for (auto api : sh->getCompiledApi())
-    {
-      if (RtAudio::getApiDisplayName(api) != gStartup.driver) continue;
-      sh->setAudioApi(api);
-      break;
-    }
+      if (RtAudio::getApiDisplayName(api) == gStartup.driver) st.audioApiName = RtAudio::getApiName(api);
   }
+  st.outputDeviceName = gStartup.output;
+  st.inputDeviceName.clear();
+  // The instrument has no audio input.
+  st.audioInputUsed = false;
+  st.audioOutputUsed = true;
+  st.sampleRate = gStartup.sampleRate > 0 ? gStartup.sampleRate : 0;
+  if (gStartup.bufferSize > 0) st.bufferSize = static_cast<uint32_t>(gStartup.bufferSize);
 
-  // Resolve against what is actually here. A device named in the file and
-  // since unplugged falls back to the system default rather than to nothing.
-  auto [defaultIn, defaultOut, defaultRate] = sh->getDefaultAudioInOutSampleRate();
-  unsigned int outId = defaultOut;
-  if (!gStartup.output.empty())
-  {
-    for (const auto &info : sh->getOutputAudioDevices())
-      if (info.name == gStartup.output) outId = info.ID;
-  }
-
-  int32_t rate = gStartup.sampleRate > 0 ? gStartup.sampleRate : defaultRate;
-
-  if (gStartup.bufferSize > 0) sh->currentBufferSize = static_cast<uint32_t>(gStartup.bufferSize);
-
-  // The instrument has no audio input: pass 0 as the input device and let
-  // startAudioThread's own useInput test fail.
-  sh->setStartupAudio(0, outId, rate);
-
-  // startMIDIThread opens what the host's settings name.
   if (!gStartup.midiInput.empty() && gStartup.midiInput != "All")
   {
-    sh->settings.midiBindAllPorts = false;
-    sh->settings.midiPortNames = {gStartup.midiInput};
+    st.midiBindAllPorts = false;
+    st.midiPortNames = {gStartup.midiInput};
   }
   else
   {
-    sh->settings.midiBindAllPorts = true;
-    sh->settings.midiPortNames.clear();
+    st.midiBindAllPorts = true;
+    st.midiPortNames.clear();
   }
+  sh->saveStandaloneSettings();
 }
 }  // namespace freeaudio::clap_wrapper::standalone::devices
