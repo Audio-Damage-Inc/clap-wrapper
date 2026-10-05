@@ -1433,6 +1433,13 @@ void ClapAsVst3::setupPresets()
   // count must not change once the component is active (the process adapter
   // holds a raw pointer into the container), so onIdle() grows it in place.
   // Only a completed crawl is published; a mid-crawl size is a fragment.
+  // A short, bounded wait for the crawl. Most hosts read the program list once,
+  // when the plug-in is instantiated, and never act on the later
+  // notifyProgramListChange -- which in any case only comes from onIdle(), and
+  // on Linux that runs only once the component is active. A typical preset
+  // folder crawls in a few milliseconds; a huge one still falls back to growing
+  // the list later rather than stalling the host. (Audio Damage change.)
+  _presetIndex->waitUntilComplete(kPresetCrawlWaitMs);
   const auto presetCount = _presetIndex->isComplete() ? _presetIndex->size() : 0;
 
   auto *selector = Vst3Parameter::createPresetSelector(id, (int32_t)presetCount);

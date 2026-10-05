@@ -517,6 +517,8 @@ class ClapAsVst3 : public Steinberg::Vst::SingleComponentEffect,
   // store, the audio thread decides and publishes in a single compare-exchange
   // (\see onRequestPresetLoad). Armed by setState() and nowhere else, so a
   // fresh instance's first program change is a real one.
+  // How long setupPresets() waits for the preset crawl before publishing.
+  static constexpr unsigned kPresetCrawlWaitMs = 500;
   static constexpr int64_t kNoPresetRequest = -1;
   static constexpr int64_t kAdoptNextPresetValue = -2;
   std::atomic<int64_t> _presetLoadRequest{kNoPresetRequest};
