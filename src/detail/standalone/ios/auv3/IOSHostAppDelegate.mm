@@ -23,11 +23,14 @@
 */
 
 #import "IOSHostAppDelegate.h"
+#import "ios_devices.h"
 #import <AudioToolbox/AudioToolbox.h>
 #import <CoreAudioKit/CoreAudioKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMIDI/CoreMIDI.h>
 #include <atomic>
+#include <cmath>
+#include <cstdlib>
 #include <mach/mach_time.h>
 
 static OSType FourCCFromString(const char *s)
@@ -85,6 +88,13 @@ static_assert((kMidiOutRingSize & kMidiOutRingMask) == 0, "kMidiOutRingSize must
 @property(nonatomic, assign) MIDIEndpointRef midiVirtualSource;
 @property(nonatomic, strong) dispatch_source_t midiOutDrainTimer;
 @property(nonatomic, copy) AUScheduleMIDIEventBlock scheduleMIDIBlock;
+// Audio Damage addition: which CoreMIDI source is bound, -1 for every one of
+// them (the default). See ios_devices.h.
+@property(nonatomic, assign) int selectedMidiSource;
+- (void)configureAudioSession;
+- (void)buildEngineGraph;
+- (void)tearDownEngineGraph;
+- (void)connectMIDISources;
 @end
 
 // CoreMIDI receive callback. Runs on a dedicated high-priority MIDI thread.
@@ -106,11 +116,19 @@ static void IOSHostMIDIReadProc(const MIDIPacketList *pktlist, void *readProcRef
   }
 }
 
+// Audio Damage addition: the live controller, for the settings facade at the
+// bottom of this file. Weak: the app owns it, and a facade call that arrives
+// before viewDidLoad or after teardown answers with empty lists instead of a
+// dangling send.
+static __weak IOSHostViewController *gHostViewController = nil;
+
 @implementation IOSHostViewController
 
 - (void)viewDidLoad
 {
   [super viewDidLoad];
+  gHostViewController = self;
+  self.selectedMidiSource = -1;
   self.view.backgroundColor = [UIColor systemBackgroundColor];
 
   self.statusLabel = [[UILabel alloc] init];
@@ -249,21 +267,62 @@ static void IOSHostMIDIReadProc(const MIDIPacketList *pktlist, void *readProcRef
   }
   self.midiInputPort = port;
 
-  [self connectAllMIDISources];
+  // The saved selection, by name: CoreMIDI's source INDEX is assigned per
+  // enumeration and means nothing across launches.
+  const auto &startup = freeaudio::clap_wrapper::standalone::ios_devices::savedStartup();
+  if (!startup.midiInput.empty() && startup.midiInput != "All")
+  {
+    ItemCount count = MIDIGetNumberOfSources();
+    for (ItemCount i = 0; i < count; ++i)
+    {
+      CFStringRef name = NULL;
+      if (MIDIObjectGetStringProperty(MIDIGetSource(i), kMIDIPropertyDisplayName, &name) != noErr)
+        continue;
+      const bool match =
+          [(__bridge NSString *)name isEqualToString:@(startup.midiInput.c_str())] == YES;
+      CFRelease(name);
+      if (match)
+      {
+        self.selectedMidiSource = (int)i;
+        break;
+      }
+    }
+  }
+
+  [self connectMIDISources];
 }
 
 - (void)connectAllMIDISources
 {
+  [self connectMIDISources];
+}
+
+// Audio Damage addition: bind what selectedMidiSource asks for. Every source
+// disconnected first, so this is also how a selection CHANGES -- and a
+// source that has gone away since it was picked leaves everything bound
+// rather than nothing, because silence looks like a broken build.
+- (void)connectMIDISources
+{
   if (!self.midiInputPort) return;
+
   ItemCount count = MIDIGetNumberOfSources();
+  const BOOL one = self.selectedMidiSource >= 0 && (ItemCount)self.selectedMidiSource < count;
+
   for (ItemCount i = 0; i < count; ++i)
   {
     MIDIEndpointRef src = MIDIGetSource(i);
+    // Disconnecting one that was never connected is not an error here; it
+    // returns a status we have nothing to do about either way.
+    MIDIPortDisconnectSource(self.midiInputPort, src);
+    if (one && (ItemCount)self.selectedMidiSource != i) continue;
+
     // Idempotent — CoreMIDI ignores a duplicate connect call with
     // kMIDIUnknownProperty status rather than creating two routes.
     MIDIPortConnectSource(self.midiInputPort, src, NULL);
   }
-  NSLog(@"[ios-host] MIDI connected to %lu source(s)", (unsigned long)count);
+
+  NSLog(@"[ios-host] MIDI connected to %@ of %lu source(s)", one ? @"1" : @"all",
+        (unsigned long)count);
 }
 
 - (void)setupMIDIOutput
@@ -392,13 +451,26 @@ static void IOSHostMIDIReadProc(const MIDIPacketList *pktlist, void *readProcRef
   if (err) NSLog(@"[ios-host] AVAudioSession setCategory: %@", err);
   err = nil;
 
-  // Request a 256-frame I/O buffer for snappier note response. iOS
-  // rounds to its nearest supported size (typically powers of two
-  // between 64 and 4096); the actual value is read back after
-  // setActive:. Must be set BEFORE activation for the hardware to
+  // What the plugin saved last time, or the defaults. 256 frames for snappier
+  // note response; the rate left to the system unless something asked.
+  const auto &startup = freeaudio::clap_wrapper::standalone::ios_devices::savedStartup();
+
+  if (startup.sampleRate > 0)
+  {
+    [session setPreferredSampleRate:(double)startup.sampleRate error:&err];
+    if (err) NSLog(@"[ios-host] setPreferredSampleRate: %@", err);
+    err = nil;
+  }
+
+  // Request an I/O buffer. iOS rounds to its nearest supported size
+  // (typically powers of two between 64 and 4096); the actual value is read
+  // back after setActive:. Must be set BEFORE activation for the hardware to
   // honor it on this session.
-  const AVAudioFrameCount preferredFrames = 256;
-  double rateForPrefs = session.sampleRate > 0 ? session.sampleRate : 48000.0;
+  const AVAudioFrameCount preferredFrames =
+      startup.bufferSize > 0 ? (AVAudioFrameCount)startup.bufferSize : 256;
+  double rateForPrefs = startup.sampleRate > 0    ? (double)startup.sampleRate
+                        : session.sampleRate > 0 ? session.sampleRate
+                                                 : 48000.0;
   [session setPreferredIOBufferDuration:((double)preferredFrames / rateForPrefs) error:&err];
   if (err) NSLog(@"[ios-host] setPreferredIOBufferDuration: %@", err);
   err = nil;
@@ -678,3 +750,201 @@ static void IOSHostMIDIReadProc(const MIDIPacketList *pktlist, void *readProcRef
 }
 
 @end
+
+/*
+ * Audio Damage addition: the settings facade declared in ios_devices.h.
+ *
+ * Every entry point here is main-thread: the plugin's settings page calls
+ * them from its UI, the session and the engine graph are the controller's,
+ * and the controller is the main thread's. Nothing here is callable from the
+ * render block and nothing here needs to be.
+ */
+namespace freeaudio::clap_wrapper::standalone::ios_devices
+{
+namespace
+{
+Startup gStartup;
+
+// What a phone or a tablet is worth asking for. iOS reports only the rate it
+// settled on, never a list, so this is a ladder and the selection below is
+// matched against the session.
+const std::vector<int> &rateLadder()
+{
+  static const std::vector<int> ladder{44100, 48000, 88200, 96000};
+  return ladder;
+}
+
+const std::vector<int> &bufferLadder()
+{
+  static const std::vector<int> ladder{64, 128, 256, 512, 1024, 2048};
+  return ladder;
+}
+
+AVAudioSession *session()
+{
+  return [AVAudioSession sharedInstance];
+}
+
+// The block the session is actually running, in frames. IOBufferDuration is
+// seconds and rounds, so this comes back near one of the ladder's entries
+// rather than on it.
+int currentFrames()
+{
+  AVAudioSession *s = session();
+  if (s.sampleRate <= 0.0) return 0;
+  return (int)lround(s.IOBufferDuration * s.sampleRate);
+}
+
+// The nearest ladder entry to what the session reports, which is the row to
+// draw as being in force.
+int nearest(const std::vector<int> &ladder, int value)
+{
+  if (value <= 0) return -1;
+
+  int best = -1;
+  int bestDistance = 0;
+  for (size_t i = 0; i < ladder.size(); ++i)
+  {
+    const int distance = std::abs(ladder[i] - value);
+    if (best < 0 || distance < bestDistance)
+    {
+      best = (int)i;
+      bestDistance = distance;
+    }
+  }
+  return best;
+}
+
+std::string toStdString(NSString *string)
+{
+  return string == nil ? std::string{} : std::string{[string UTF8String]};
+}
+}  // namespace
+
+const Startup &savedStartup()
+{
+  return gStartup;
+}
+
+void setStartup(Startup startup)
+{
+  gStartup = std::move(startup);
+}
+
+Choices sampleRates()
+{
+  Choices out;
+  for (int rate : rateLadder()) out.names.push_back(std::to_string(rate));
+  out.selected = nearest(rateLadder(), (int)lround(session().sampleRate));
+  return out;
+}
+
+void setSampleRate(int index)
+{
+  const auto &ladder = rateLadder();
+  if (index < 0 || index >= (int)ladder.size()) return;
+
+  IOSHostViewController *vc = gHostViewController;
+  if (vc == nil) return;
+
+  NSError *err = nil;
+  [session() setPreferredSampleRate:(double)ladder[(size_t)index] error:&err];
+  if (err) NSLog(@"[ios-host] setPreferredSampleRate: %@", err);
+
+  // A preferred rate only takes hold on a session that is going active, and
+  // every AU bus and the engine's formats are pinned to the old one. Tear the
+  // graph down, let configureAudioSession re-ask and re-activate, build
+  // again -- the same sequence the route-change and interruption handlers
+  // run when the hardware moves the rate under us.
+  [vc tearDownEngineGraph];
+  [vc configureAudioSession];
+  [vc buildEngineGraph];
+}
+
+Choices bufferSizes()
+{
+  Choices out;
+  for (int frames : bufferLadder()) out.names.push_back(std::to_string(frames));
+  out.selected = nearest(bufferLadder(), currentFrames());
+  return out;
+}
+
+void setBufferSize(int index)
+{
+  const auto &ladder = bufferLadder();
+  if (index < 0 || index >= (int)ladder.size()) return;
+
+  IOSHostViewController *vc = gHostViewController;
+  if (vc == nil) return;
+
+  AVAudioSession *s = session();
+  const double rate = s.sampleRate > 0.0 ? s.sampleRate : 48000.0;
+
+  NSError *err = nil;
+  [s setPreferredIOBufferDuration:((double)ladder[(size_t)index] / rate) error:&err];
+  if (err) NSLog(@"[ios-host] setPreferredIOBufferDuration: %@", err);
+
+  // Same reason as the rate: the request is read when the session activates.
+  // The AU's maximumFramesToRender is 4096 either way, so the graph itself
+  // does not care -- but the engine has to be restarted to pick the new
+  // hardware block up.
+  [vc tearDownEngineGraph];
+  [vc configureAudioSession];
+  [vc buildEngineGraph];
+}
+
+Choices midiInputs()
+{
+  Choices out;
+  out.names.push_back("All");
+
+  ItemCount count = MIDIGetNumberOfSources();
+  for (ItemCount i = 0; i < count; ++i)
+  {
+    CFStringRef name = NULL;
+    if (MIDIObjectGetStringProperty(MIDIGetSource(i), kMIDIPropertyDisplayName, &name) == noErr)
+    {
+      out.names.push_back(toStdString((__bridge NSString *)name));
+      CFRelease(name);
+    }
+    else
+    {
+      out.names.push_back("Source " + std::to_string((long)i + 1));
+    }
+  }
+
+  IOSHostViewController *vc = gHostViewController;
+  const int selected = vc == nil ? -1 : vc.selectedMidiSource;
+  out.selected = (selected < 0 || selected + 1 >= (int)out.names.size()) ? 0 : selected + 1;
+  return out;
+}
+
+void setMidiInput(int index)
+{
+  IOSHostViewController *vc = gHostViewController;
+  if (vc == nil) return;
+
+  vc.selectedMidiSource = index <= 0 ? -1 : index - 1;
+  [vc connectMIDISources];
+}
+
+std::string route()
+{
+  AVAudioSessionRouteDescription *current = session().currentRoute;
+  if (current.outputs.count == 0) return "No output";
+
+  // One name even when the route has several ports: a settings row is one
+  // line, and the first is the one audio is actually leaving by.
+  return toStdString(current.outputs.firstObject.portName);
+}
+
+std::string status()
+{
+  AVAudioSession *s = session();
+  if (s.sampleRate <= 0.0) return "No audio session";
+
+  const int frames = currentFrames();
+  return std::to_string((int)lround(s.sampleRate)) + " Hz / " + std::to_string(frames) +
+         " samples";
+}
+}  // namespace freeaudio::clap_wrapper::standalone::ios_devices
