@@ -48,10 +48,14 @@ function(make_clapfirst_plugins)
             AUV2_MANUFACTURER_CODE # auv2 extension
             AUV2_SUBTYPE_CODE
             AUV2_INSTRUMENT_TYPE
+
+            AUV3_ENTITLEMENTS          # optional, passed on to target_add_auv3_wrapper as ENTITLEMENTS
+            AUV3_INFO_PLIST_ADDITIONS  # optional, passed on as INFO_PLIST_ADDITIONS
     )
     set(multiValueArgs
             PLUGIN_FORMATS   # A list of plugin formats, "CLAP" "VST3" "AUV2" "AAX"
             STANDALONE_CONFIGURATIONS # standalone configuration. This is a list of target names and clap ids
+            STANDALONE_URL_SCHEMES # url schemes a link opens every standalone with (URL_SCHEMES)
     )
     cmake_parse_arguments(C1ST "" "${oneValueArgs}" "${multiValueArgs}" ${ARGN} )
 
@@ -229,6 +233,13 @@ function(make_clapfirst_plugins)
         # so wire the wrapper directly to that symbol instead of relying on
         # CFBundle-based self-resolution of an MH_EXECUTE binary at runtime.
         target_compile_definitions(${AUV3_TARGET} PRIVATE STATICALLY_LINKED_CLAP_ENTRY=1)
+        set(_c1st_auv3_extra_args "")
+        if (DEFINED C1ST_AUV3_ENTITLEMENTS)
+            list(APPEND _c1st_auv3_extra_args ENTITLEMENTS "${C1ST_AUV3_ENTITLEMENTS}")
+        endif()
+        if (DEFINED C1ST_AUV3_INFO_PLIST_ADDITIONS)
+            list(APPEND _c1st_auv3_extra_args INFO_PLIST_ADDITIONS "${C1ST_AUV3_INFO_PLIST_ADDITIONS}")
+        endif()
         if (DEFINED C1ST_AUV2_MANUFACTURER_CODE)
             target_add_auv3_wrapper(
                     TARGET ${AUV3_TARGET}
@@ -236,6 +247,8 @@ function(make_clapfirst_plugins)
                     BUNDLE_IDENTIFIER "${C1ST_BUNDLE_IDENTIFIER}.auv3"
                     BUNDLE_VERSION "${C1ST_BUNDLE_VERSION}"
                     RESOURCE_DIRECTORY "${C1ST_RESOURCE_DIRECTORY}"
+
+                    ${_c1st_auv3_extra_args}
 
                     MANUFACTURER_NAME "${C1ST_AUV2_MANUFACTURER_NAME}"
                     MANUFACTURER_CODE "${C1ST_AUV2_MANUFACTURER_CODE}"
@@ -249,6 +262,8 @@ function(make_clapfirst_plugins)
                     BUNDLE_IDENTIFIER "${C1ST_BUNDLE_IDENTIFIER}.auv3"
                     BUNDLE_VERSION "${C1ST_BUNDLE_VERSION}"
                     RESOURCE_DIRECTORY "${C1ST_RESOURCE_DIRECTORY}"
+
+                    ${_c1st_auv3_extra_args}
 
                     CLAP_TARGET_FOR_CONFIG "${CLAP_TARGET}"
             )
@@ -384,6 +399,7 @@ function(make_clapfirst_plugins)
                         WINDOWS_ICON "${C1ST_STANDALONE_WINDOWS_ICON}"
                         RESOURCE_DIRECTORY "${C1ST_RESOURCE_DIRECTORY}"
                         BUNDLE_VERSION "${C1ST_BUNDLE_VERSION}"
+                        URL_SCHEMES ${C1ST_STANDALONE_URL_SCHEMES}
                 )
                 if (DEFINED C1ST_ASSET_OUTPUT_DIRECTORY)
                     if (NOT WIN32)
