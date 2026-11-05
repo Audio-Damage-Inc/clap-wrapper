@@ -234,6 +234,9 @@ void X11Gui::setPlugin(std::shared_ptr<Clap::Plugin> p)
     }
     else
     {
+      // This window is X11 and the plugin lives in the main program, where visage would
+      // otherwise size itself from Wayland before it is handed its X11 parent.
+      setenv("VISAGE_WINDOWING", "x11", 0);
       ui->create(pl, CLAP_WINDOW_API_X11, false);
       uint32_t w, h;
       ui->get_size(pl, &w, &h);
