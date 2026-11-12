@@ -593,6 +593,9 @@ class WrapAsAUV2 : public ausdk::AUBase,
   OSStatus SaveState(CFPropertyListRef *ptPList) override;
   OSStatus RestoreState(CFPropertyListRef plist) override;
 
+  /// Clears host render caches, pending notes, and the active CLAP processor.
+  OSStatus Reset(AudioUnitScope scope, AudioUnitElement element) override;
+
   // render
   OSStatus Render(AudioUnitRenderActionFlags &inFlags, const AudioTimeStamp &inTimeStamp,
                   UInt32 inFrames) override;
@@ -1011,8 +1014,6 @@ class WrapAsAUV2 : public ausdk::AUBase,
   // what keeps SetBypassEffect() - which sets _isBypassed itself before
   // writing the parameter - from announcing the host's own write back to it.
   void noteBypassParameterValue(clap_id id, double value);
-
-  CFStringRef _current_program_name = 0;
 
   // ------------- for the MIDI output
   AUMIDIOutputCallbackStruct _midioutput_hostcallback = {nullptr, nullptr};

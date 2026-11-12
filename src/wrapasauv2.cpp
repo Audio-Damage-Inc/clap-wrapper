@@ -160,42 +160,54 @@ WrapAsAUV2::WrapAsAUV2(const std::string &clapname, const std::string &clapid, i
   , _idx{idx}
   , _os_attached([this] { os::attach(this); }, [this] { os::detach(this); })
 {
+  _uiIsOpened = false;
+  // Fail the AudioComponent open before the SDK publishes an unusable unit.
+  ausdk::ThrowExceptionIf(!initializeClapDesc(), kAudioUnitErr_FailedInitialization);
+
+  // pffffrzz();  // <- enable this to have a hook to attach a debugger
+  _underlying_hostname = os::getHostAppName();
+  _plugin = Clap::Plugin::createInstance(_library._pluginFactory, _desc->id, this);
+  ausdk::ThrowExceptionIf(!_plugin || !_plugin->initialize(), kAudioUnitErr_FailedInitialization);
+  std::cout << "[clap-wrapper] auv2: Initialized '" << _desc->id << "' / '" << _desc->name << "' / '"
+            << _desc->version << "'" << std::endl;
+
   // Logic may initialize an AU on a worker while its editor and idle timer run.
   // The SDK holds this lock across its complete non-realtime dispatch, including
   // changes to AUBase::IsInitialized() before and after the virtual callbacks.
   SetMutex(_mainThreadMutex.get());
-  _uiIsOpened = false;
-  if (!_desc)
-  {
-    if (initializeClapDesc())
-    {
-      std::cout << "[clap-wrapper] auv2: Initialized '" << _desc->id << "' / '" << _desc->name << "' / '"
-                << _desc->version << "'" << std::endl;
-      /*
-       * ToDo: Stand up the host, create the plugin instance here
-       */
-
-      // pffffrzz();  // <- enable this to have a hook to attach a debugger
-      _underlying_hostname = os::getHostAppName();
-      _plugin = Clap::Plugin::createInstance(_library._pluginFactory, _desc->id, this);
-      if (_plugin)
-      {
-        _plugin->initialize();
-      }
-      else
-      {
-        std::cout << "[clap-wrapper] ERROR: the clap did not create an instance with id " << _desc->id
-                  << std::endl;
-        // this will exit in WrapAsAUV2::Initialize() with an error
-        // if this happens, the wrapper or the clap plugin has a real bug
-        _desc = nullptr;
-      }
-    }
-  }
 }
 
 WrapAsAUV2::~WrapAsAUV2()
 {
+  // An editor still open goes first: it is AppKit's, and removing its view on
+  // another thread throws there. A host may dispose of an instance from another
+  // thread (an out-of-process AU host does when its application quits), so the
+  // editor is destroyed on the main thread, before the lock below: the view
+  // takes the lock on the main thread, and waiting for the main thread while
+  // holding it could deadlock.
+  const auto destroyOpenUI = [this]
+  {
+    if (_uiIsOpened && _uiconn._canary)
+    {
+      *_uiconn._canary = 0;       // notify the view
+      _uiconn._canary = nullptr;  // disable the canary reference
+
+      // close destroy the gui ourselves
+      _plugin->_ext._gui->destroy(_plugin->_plugin);
+      _uiconn._window = nullptr;
+      _uiIsOpened = false;
+    }
+  };
+  if (_plugin && !auv2shared_mm_is_main_thread())
+  {
+    auv2shared_mm_run_on_main_thread(
+        [&]
+        {
+          const ausdk::AUEntryGuard uiGuard(_mainThreadMutex.get());
+          destroyOpenUI();
+        });
+  }
+
   const std::lock_guard<ausdk::AUMutex> mainThreadGuard(*_mainThreadMutex);
   // The index outlives this instance (it is cached per module) and its crawl
   // thread holds our callback, so it has to be dropped before anything else.
@@ -215,24 +227,11 @@ WrapAsAUV2::~WrapAsAUV2()
 #endif
   if (_plugin)
   {
-    if (_uiIsOpened && _uiconn._canary)
-    {
-      *_uiconn._canary = 0;       // notify the view
-      _uiconn._canary = nullptr;  // disable the canary reference
-
-      // close destroy the gui ourselves
-      _plugin->_ext._gui->destroy(_plugin->_plugin);
-      _uiconn._window = nullptr;
-      _uiIsOpened = false;
-    }
+    destroyOpenUI();
 
     _os_attached.off();
     _plugin->terminate();
     _plugin.reset();
-  }
-  if (_current_program_name)
-  {
-    CFRelease(_current_program_name);
   }
   // AUBase must not retain a pointer to a member-owned lock during base destruction.
   SetMutex(nullptr);
@@ -956,7 +955,18 @@ void WrapAsAUV2::Cleanup()
 {
   LOGINFO("[clap-wrapper] Cleaning up Plugin");
   auto guarantee_mainthread = _plugin->AlwaysMainThread();
-  if (this->_uiIsOpened)
+  // The editor is AppKit's, so it is destroyed here on the main thread only. A
+  // host may uninitialize from another thread (an out-of-process AU host does
+  // when its application quits); removing the view there throws in AppKit. Nor
+  // can this wait for the main thread: the SDK holds _mainThreadMutex across
+  // this call and the view takes it there. The editor stays open - a plugin
+  // that is not active may keep its GUI - until its view goes or the instance
+  // is destroyed, which both close it on the main thread.
+  if (this->_uiIsOpened && !auv2shared_mm_is_main_thread())
+  {
+    LOGINFO("[clap-wrapper] UI still open, uninitialized off the main thread: left to its view");
+  }
+  else if (this->_uiIsOpened)
   {
     LOGINFO("[clap-wrapper] !! UI still open, destroying UI and disconnecting view");
     if (_uiconn._canary)
@@ -1313,6 +1323,7 @@ OSStatus WrapAsAUV2::SetProperty(AudioUnitPropertyID inID, AudioUnitScope inScop
         {
           if (!tempNewSetting && IsBypassEffect() && IsInitialized())
           {  // turning bypass off and we're initialized
+            // Reset the CLAP processor's audio history before resuming from bypass.
             Reset(kAudioUnitScope_Global, 0);
           }
           SetBypassEffect(tempNewSetting);
@@ -1795,6 +1806,17 @@ void WrapAsAUV2::releaseHostMIDIOutput()
   for (auto blk : _retiredEventListBlocks) Block_release(blk);
   _retiredEventListBlocks.clear();
 #endif
+}
+
+OSStatus WrapAsAUV2::Reset(AudioUnitScope scope, AudioUnitElement element)
+{
+  ClapWrapper::detail::shared::SpinLockGuard processGuard(_processLock);
+  const auto result = Base::Reset(scope, element);
+  if (result != noErr) return result;
+  if (_processAdapter) _processAdapter->reset();
+  if (_flushAdapter) _flushAdapter->reset();
+  if (_initialized) _plugin->reset();
+  return noErr;
 }
 
 OSStatus WrapAsAUV2::Render(AudioUnitRenderActionFlags &inFlags, const AudioTimeStamp &inTimeStamp,
@@ -2361,13 +2383,17 @@ OSStatus WrapAsAUV2::SaveState(CFPropertyListRef *ptPList)
     CFRelease(tData);
     chunk.clear();
 
-    if (_current_program_name == nullptr)
+    // The name is the present preset's, as AUBase::SaveState writes it: the
+    // factory preset the host or the plugin chose last, or the name of the
+    // state restored last.
+    AUPreset present{};
+    if (DispatchGetProperty(kAudioUnitProperty_PresentPreset, kAudioUnitScope_Global, 0, &present) ==
+            noErr &&
+        present.presetName)
     {
-      _current_program_name = CFStringCreateWithCString(NULL, "Program", kCFStringEncodingUTF8);
+      CFDictionarySetValue(*dict, CFSTR(kAUPresetNameKey), present.presetName);
+      CFRelease(present.presetName);  // retained for the caller
     }
-    // const char  *name = "blarb";
-    // mPlugin->getProgramName(name);
-    CFDictionarySetValue(*dict, CFSTR(kAUPresetNameKey), _current_program_name);
 
     *ptPList = static_cast<CFPropertyListRef>(dict.release());  // transfer ownership
 #endif
@@ -2390,6 +2416,15 @@ OSStatus WrapAsAUV2::RestoreState(CFPropertyListRef plist)
   {
     return -1;
   }
+
+  // The saved name becomes the present preset, as in AUBase::RestoreState, so
+  // the next SaveState writes it again. Set before the state loads: a preset
+  // the plugin reports as loaded from it takes its place.
+  const void *pName = CFDictionaryGetValue(tDict, CFSTR(kAUPresetNameKey));
+  const bool hasName = pName && CFGetTypeID(CFTypeRef(pName)) == CFStringGetTypeID();
+  NewCustomPresetSet(AUPreset{-1, hasName ? static_cast<CFStringRef>(pName) : CFSTR("Untitled")});
+  PropertyChanged(kAudioUnitProperty_PresentPreset, kAudioUnitScope_Global, 0);
+
   /*
    * In the read side I fall through to default, whereas in the write
    * side I use an 'else' on the set of stream formats. This means
@@ -2421,12 +2456,6 @@ OSStatus WrapAsAUV2::RestoreState(CFPropertyListRef plist)
     return noErr;
   }
 #endif
-
-  const void *pName = CFDictionaryGetValue(tDict, CFSTR(kAUPresetNameKey));
-  if (pName)
-  {
-    _current_program_name = CFStringCreateCopy(NULL, (CFStringRef)pName);
-  }
 
   CFDataRef tData = CFDataRef(pData);
 
