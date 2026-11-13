@@ -425,7 +425,8 @@ function(target_add_standalone_wrapper)
                 ${CLAP_WRAPPER_CMAKE_CURRENT_SOURCE_DIR}/src/wrapasstandalone.cpp)
 
         message(STATUS "clap-wrapper: Using Standalone X11 gui for CLAP Wrapper")
-        target_link_libraries(${salib} PUBLIC X11)
+        # Xrandr: the monitors, to open the window in the middle of one and no bigger
+        target_link_libraries(${salib} PUBLIC X11 Xrandr)
         target_compile_definitions(${salib} PUBLIC CLAP_WRAPPER_STANDALONE_X11)
         if(CLAP_WRAPPER_STANDALONE_X11_HIDE_STRIP)
             target_compile_definitions(${salib} PUBLIC CLAP_WRAPPER_STANDALONE_X11_HIDE_STRIP=1)

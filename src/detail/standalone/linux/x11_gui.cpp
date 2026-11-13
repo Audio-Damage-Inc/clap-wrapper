@@ -1,7 +1,9 @@
 
 
 #include <X11/Xlib.h>
+#include <X11/Xatom.h>
 #include <X11/Xutil.h>
+#include <X11/extensions/Xrandr.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/timerfd.h>
@@ -9,6 +11,8 @@
 #include <poll.h>
 #include <string.h>
 #include <cstdint>
+#include <cmath>
+#include <vector>
 #include <algorithm>
 
 #include "x11_gui.h"
@@ -76,6 +80,7 @@ void X11Gui::runloop()
     {
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
       pollAudioEvents();
+      serviceRequests();
     }
     return;
   }
@@ -107,6 +112,8 @@ void X11Gui::runloop()
         {
           case MapNotify:
           {
+            // placed: the size hints stop saying where
+            placing = false;
             if (plugin && plugin->_ext._gui && pluginWindow)
             {
               clap_window win;
@@ -153,6 +160,7 @@ void X11Gui::runloop()
     int num{0};
     if (running) num = epoll_wait(epoll_fd, events, maxEpollEvents, 50);
     pollAudioEvents();
+    serviceRequests();
 
     if (num > 0)
     {
@@ -206,6 +214,28 @@ void X11Gui::pollAudioEvents()
   updateStatus();
 }
 
+// request_callback, request_restart and request_process, flags the plugin may set from
+// any thread, acted on at the loop's next turn, as the macOS and Windows timers do. Never
+// done, a plugin waiting on on_main_thread for work a thread of its own has finished
+// waits for good
+void X11Gui::serviceRequests()
+{
+  if (!host || !plugin) return;
+  auto *pl = plugin->_plugin;
+
+  if (host->callbackRequested.exchange(false)) pl->on_main_thread(pl);
+
+  // an inactive plugin has nothing to restart. activatePlugin parks the callback,
+  // reactivates, and lets processing resume, or leaves it stopped if the plugin refuses
+  if (host->restartRequested.exchange(false) && host->isActive)
+    host->activatePlugin(host->currentSampleRate, 1, host->currentBufferSize * 2);
+
+  // the standalone owns its audio engine, so a wake-up stands an inactive plugin up; an
+  // active one is already being pulled by the callback. Never before the engine has run
+  if (host->processRequested.exchange(false) && !host->isActive && host->currentSampleRate > 0)
+    host->activatePlugin(host->currentSampleRate, 1, host->currentBufferSize * 2);
+}
+
 void X11Gui::openSettings()
 {
   if (!display || !host) return;
@@ -245,26 +275,27 @@ void X11Gui::setPlugin(std::shared_ptr<Clap::Plugin> p)
       pluginWidth = static_cast<int>(w);
       pluginHeight = static_cast<int>(h);
       hasGui = true;
-
-      // the smallest size the plugin accepts, from a request smaller than any it would
       pluginCanResize = ui->can_resize(pl);
-      if (pluginCanResize)
-      {
-        uint32_t mw{1}, mh{1};
-        ui->adjust_size(pl, &mw, &mh);
-        pluginMinWidth = static_cast<int>(mw);
-        pluginMinHeight = static_cast<int>(mh);
-      }
     }
   }
 
   // the window is there with or without a gui: the strip has the settings, and closing
   // the window quits as it does with one
   showStrip = !hideStrip || !hasGui;
+
+  // it opens in the middle of the screen it opens on, and no bigger than that screen: a
+  // plugin that would not fit is given the largest size that does
+  const Rect area{openingArea()};
+  if (hasGui) fitPluginInto(area.w, area.h - stripShown());
+  const int windowW{widthFor(pluginWidth)}, windowH{pluginHeight + stripShown()};
+  placeX = area.x + std::max(0, (area.w - windowW) / 2);
+  placeY = area.y + std::max(0, (area.h - windowH) / 2);
+  placing = true;
+
   int s = DefaultScreen(display);
-  window = XCreateSimpleWindow(
-      display, RootWindow(display, s), 10, 10, static_cast<unsigned>(widthFor(pluginWidth)),
-      static_cast<unsigned>(pluginHeight + stripShown()), 0, theme.strip, theme.strip);
+  window = XCreateSimpleWindow(display, RootWindow(display, s), placeX, placeY,
+                               static_cast<unsigned>(windowW), static_cast<unsigned>(windowH), 0,
+                               theme.strip, theme.strip);
   XStoreName(display, window, plugin->_plugin->desc->name);
   XSelectInput(display, window,
                StructureNotifyMask | ExposureMask | ButtonPressMask | ButtonReleaseMask |
@@ -319,34 +350,155 @@ constexpr int restoreCheckSize{13};
 
 // the window's size from the plugin's: the strip above it, at least wide enough for the
 // strip's text and button, or the plugin's own where there is no strip
+//
+// held at that size to the window manager, which is what has a tiling one (Hyprland,
+// sway, i3) float the window rather than tile it. A plugin that can be resized resizes
+// it from inside, with request_resize. The hints go first, so that a manager holding the
+// window to its last size grants the next one
 void X11Gui::layoutWindow()
 {
   if (!display || window == 0) return;
   const int w{widthFor(pluginWidth)}, h{pluginHeight + stripShown()};
+
+  XSizeHints *hints = XAllocSizeHints();
+  hints->flags = PMinSize | PMaxSize;
+  hints->min_width = hints->max_width = w;
+  hints->min_height = hints->max_height = h;
+  if (placing)
+  {
+    hints->flags |= USPosition | PPosition;
+    hints->x = placeX;
+    hints->y = placeY;
+  }
+  XSetWMNormalHints(display, window, hints);
+  XFree(hints);
+
   XResizeWindow(display, window, static_cast<unsigned>(w), static_cast<unsigned>(h));
   if (pluginWindow)
     XResizeWindow(display, pluginWindow, static_cast<unsigned>(std::max(pluginWidth, 1)),
                   static_cast<unsigned>(std::max(pluginHeight, 1)));
 
-  // a plugin that can be resized makes the window resizable, down to its smallest size;
-  // one that cannot keeps the window at its size
-  XSizeHints *hints = XAllocSizeHints();
-  if (pluginCanResize)
-  {
-    hints->flags = PMinSize;
-    hints->min_width = widthFor(pluginMinWidth);
-    hints->min_height = pluginMinHeight + stripShown();
-  }
-  else
-  {
-    hints->flags = PMinSize | PMaxSize;
-    hints->min_width = hints->max_width = w;
-    hints->min_height = hints->max_height = h;
-  }
-  XSetWMNormalHints(display, window, hints);
-  XFree(hints);
-
   layoutStrip(w);
+}
+
+// the room a window opening now has: the monitor the pointer is on, or failing that the
+// primary one, as RandR has them, and of that the desktop's work area where the window
+// manager publishes one (Hyprland's does not, and there it is the monitor). The whole X
+// screen where there is no RandR
+Rect X11Gui::openingArea() const
+{
+  const int s{DefaultScreen(display)};
+  const ::Window root{RootWindow(display, s)};
+  Rect area{0, 0, DisplayWidth(display, s), DisplayHeight(display, s)};
+
+  int eventBase{0}, errorBase{0};
+  if (XRRQueryExtension(display, &eventBase, &errorBase))
+  {
+    int count{0};
+    if (XRRMonitorInfo *monitors{XRRGetMonitors(display, root, True, &count)})
+    {
+      ::Window rootReturn{0}, childReturn{0};
+      int pointerX{0}, pointerY{0}, windowX{0}, windowY{0};
+      unsigned int mask{0};
+      const bool pointer{XQueryPointer(display, root, &rootReturn, &childReturn, &pointerX,
+                                       &pointerY, &windowX, &windowY, &mask) == True};
+      int chosen{-1};
+      for (int i = 0; i < count && chosen < 0; ++i)
+      {
+        const Rect m{monitors[i].x, monitors[i].y, monitors[i].width, monitors[i].height};
+        if (pointer && m.contains(pointerX, pointerY)) chosen = i;
+      }
+      for (int i = 0; i < count && chosen < 0; ++i)
+        if (monitors[i].primary) chosen = i;
+      if (count > 0)
+      {
+        const auto &m{monitors[std::max(chosen, 0)]};
+        if (m.width > 0 && m.height > 0) area = {m.x, m.y, m.width, m.height};
+      }
+      XRRFreeMonitors(monitors);
+    }
+  }
+
+  // a CARDINAL[] property of the root window, from offset on, as many as there are
+  auto cardinals = [this, root](const char *name, long offset, long count)
+  {
+    std::vector<long> values;
+    const Atom atom{XInternAtom(display, name, True)};
+    if (atom == None) return values;
+    Atom type{None};
+    int format{0};
+    unsigned long items{0}, after{0};
+    unsigned char *data{nullptr};
+    if (XGetWindowProperty(display, root, atom, offset, count, False, XA_CARDINAL, &type, &format,
+                           &items, &after, &data) == Success &&
+        data)
+    {
+      // 32-bit items come back as longs
+      if (type == XA_CARDINAL && format == 32)
+      {
+        const auto *v{reinterpret_cast<const long *>(data)};
+        values.assign(v, v + items);
+      }
+      XFree(data);
+    }
+    return values;
+  };
+
+  // x, y, width and height for each desktop: the current desktop's, where it is there
+  const auto desktop{cardinals("_NET_CURRENT_DESKTOP", 0, 1)};
+  const auto work{cardinals("_NET_WORKAREA", desktop.empty() ? 0 : desktop[0] * 4, 4)};
+  if (work.size() == 4)
+  {
+    const int left{std::max(area.x, static_cast<int>(work[0]))};
+    const int top{std::max(area.y, static_cast<int>(work[1]))};
+    const int right{std::min(area.x + area.w, static_cast<int>(work[0] + work[2]))};
+    const int bottom{std::min(area.y + area.h, static_cast<int>(work[1] + work[3]))};
+    if (right > left && bottom > top) area = {left, top, right - left, bottom - top};
+  }
+  return area;
+}
+
+// a resizable plugin bigger than the room it has is asked for the largest size that fits:
+// a box in its own proportions, its aspect hint's where it gives one, put through
+// adjust_size, and smaller again for as long as the answer does not fit, since a plugin
+// may keep its proportions from the longer side and answer bigger than it was asked. It
+// hears the size with set_size, before it has a parent, as the gui extension allows
+void X11Gui::fitPluginInto(int maxWidth, int maxHeight)
+{
+  if (!pluginCanResize || !plugin || !plugin->_ext._gui) return;
+  if (maxWidth < 1 || maxHeight < 1 || pluginWidth < 1 || pluginHeight < 1) return;
+  if (pluginWidth <= maxWidth && pluginHeight <= maxHeight) return;
+
+  auto ui = plugin->_ext._gui;
+  auto pl = plugin->_plugin;
+  double aspect{static_cast<double>(pluginWidth) / pluginHeight};
+  clap_gui_resize_hints_t resizeHints{};
+  if (ui->get_resize_hints && ui->get_resize_hints(pl, &resizeHints) &&
+      resizeHints.preserve_aspect_ratio && resizeHints.aspect_ratio_width > 0 &&
+      resizeHints.aspect_ratio_height > 0)
+    aspect = static_cast<double>(resizeHints.aspect_ratio_width) / resizeHints.aspect_ratio_height;
+
+  double width{std::min(static_cast<double>(maxWidth), maxHeight * aspect)};
+  uint32_t w{0}, h{0};
+  for (int attempt = 0; attempt < 8; ++attempt)
+  {
+    w = static_cast<uint32_t>(std::max(1.0, std::floor(width)));
+    h = static_cast<uint32_t>(std::max(1.0, std::floor(width / aspect)));
+    ui->adjust_size(pl, &w, &h);
+    if (static_cast<int>(w) <= maxWidth && static_cast<int>(h) <= maxHeight) break;
+    // a plugin whose smallest size is bigger than the screen keeps that, the last answer
+    const double over{std::max(static_cast<double>(w) / maxWidth,
+                               static_cast<double>(h) / maxHeight)};
+    width = width / over - 1.0;
+  }
+
+  pluginWidth = static_cast<int>(w);
+  pluginHeight = static_cast<int>(h);
+  if (ui->set_size(pl, w, h))
+  {
+    toldWidth = pluginWidth;
+    toldHeight = pluginHeight;
+  }
 }
 
 // the strip's button and checkbox, from the right edge of a window w wide

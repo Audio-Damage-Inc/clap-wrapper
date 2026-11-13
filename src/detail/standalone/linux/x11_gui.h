@@ -88,9 +88,14 @@ struct X11Gui
   // the width the strip was last laid out for, which is a size asked for until the window
   // manager has answered
   int stripWidth{0};
-  // whether the plugin can be resized, and the smallest size its adjust_size allows
+  // whether the plugin can be resized
   bool pluginCanResize{false};
-  int pluginMinWidth{0}, pluginMinHeight{0};
+  // where the window opens: the middle of the room openingArea finds, said in its size
+  // hints until it is mapped, for window managers that otherwise place a window themselves
+  int placeX{0}, placeY{0};
+  bool placing{false};
+  Rect openingArea() const;
+  void fitPluginInto(int maxWidth, int maxHeight);
   // the size the plugin was last told of with set_size, so that a ConfigureNotify of our
   // own resize is not one more set_size
   int toldWidth{0}, toldHeight{0};
@@ -121,6 +126,8 @@ struct X11Gui
   freeaudio::clap_wrapper::standalone::StandaloneHost *host{nullptr};
   std::chrono::steady_clock::time_point nextAudioPoll{};
   void pollAudioEvents();
+  // what the plugin asked of the host, from whatever thread, done on this one
+  void serviceRequests();
 
   bool resetSizeTo(int w, int h);
 
